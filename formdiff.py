@@ -438,6 +438,28 @@ def _build_html_report(
     pending_removed: list[tuple[str, str, int]] = []
     pending_added:   list[tuple[str, str, int]] = []
 
+    def _coord_parts(coord: str) -> tuple[str, int]:
+        """Return (col_letters, row_number) from a coord like D119 or V1119:V1196."""
+        # Use only the first cell of a range
+        first = coord.split(":")[0]
+        m = COORD_RE.search(first.replace("$", ""))
+        if m:
+            return m.group(1).upper(), int(m.group(2))
+        return ("", 0)
+
+    def _make_row(row_type, sheet, coord, count, old, new) -> dict:
+        col, row_num = _coord_parts(coord)
+        return {
+            "type": row_type,
+            "sheet": sheet,
+            "coord": html_mod.escape(coord),
+            "col": col,
+            "row": row_num,
+            "count": count,
+            "old": old,
+            "new": new,
+        }
+
     def flush_pairs(sheet: str) -> None:
         pairs = min(len(pending_removed), len(pending_added))
         for i in range(pairs):
@@ -446,29 +468,11 @@ def _build_html_report(
             coord = coord_r if coord_r == coord_a else f"{coord_r} / {coord_a}"
             count = max(cnt_r, cnt_a)
             old_html, new_html = _char_diff_html(old_f, new_f)
-            rows_by_sheet[sheet].append({
-                "type": "change",
-                "coord": html_mod.escape(coord),
-                "count": count,
-                "old": old_html,
-                "new": new_html,
-            })
+            rows_by_sheet[sheet].append(_make_row("change", sheet, coord, count, old_html, new_html))
         for coord, formula, count in pending_removed[pairs:]:
-            rows_by_sheet[sheet].append({
-                "type": "remove",
-                "coord": html_mod.escape(coord),
-                "count": count,
-                "old": html_mod.escape(formula),
-                "new": "",
-            })
+            rows_by_sheet[sheet].append(_make_row("remove", sheet, coord, count, html_mod.escape(formula), ""))
         for coord, formula, count in pending_added[pairs:]:
-            rows_by_sheet[sheet].append({
-                "type": "add",
-                "coord": html_mod.escape(coord),
-                "count": count,
-                "old": "",
-                "new": html_mod.escape(formula),
-            })
+            rows_by_sheet[sheet].append(_make_row("add", sheet, coord, count, "", html_mod.escape(formula)))
 
     current_sheet = None
     for line in diff_lines:
@@ -547,10 +551,32 @@ def _build_html_report(
     .row-ctx-btn:hover { background: #21262d; color: #e6edf3; }
     /* Global toolbar */
     .toolbar { padding: 8px 20px; background: #161b22; border-bottom: 1px solid #30363d;
-               display: flex; gap: 8px; align-items: center; }
+               display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .toolbar-btn { background: #21262d; border: 1px solid #30363d; border-radius: 4px;
                    color: #c9d1d9; cursor: pointer; font-size: 11px; padding: 3px 10px; }
     .toolbar-btn:hover { background: #30363d; color: #e6edf3; }
+    /* Filter panel */
+    .filter-panel { padding: 10px 20px; background: #0d1117; border-bottom: 1px solid #30363d;
+                    display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+    .filter-panel.hidden { display: none; }
+    .filter-group { display: flex; flex-direction: column; gap: 4px; }
+    .filter-label { font-size: 10px; color: #8b949e; text-transform: uppercase; letter-spacing: .05em; }
+    .filter-sheets { display: flex; flex-wrap: wrap; gap: 6px; }
+    .sheet-chip { display: flex; align-items: center; gap: 4px; background: #21262d;
+                  border: 1px solid #30363d; border-radius: 12px; padding: 2px 8px;
+                  cursor: pointer; font-size: 11px; color: #c9d1d9; user-select: none; }
+    .sheet-chip.off { opacity: .35; }
+    .sheet-chip:hover { border-color: #58a6ff; }
+    .filter-input { background: #161b22; border: 1px solid #30363d; border-radius: 4px;
+                    color: #c9d1d9; font-family: inherit; font-size: 11px; padding: 3px 7px;
+                    width: 80px; }
+    .filter-input:focus { outline: none; border-color: #58a6ff; }
+    .filter-row-wrap { display: flex; gap: 6px; align-items: center; }
+    .filter-sep { color: #8b949e; font-size: 11px; }
+    .filter-clear { background: none; border: none; color: #8b949e; cursor: pointer;
+                    font-size: 11px; padding: 2px 6px; }
+    .filter-clear:hover { color: #f85149; }
+    tr.filtered-out { display: none; }
     """
 
     JS = """
@@ -608,10 +634,90 @@ def _build_html_report(
         document.getElementById('btn-expand-all').textContent =
             allExpanded ? '− Collapse all context' : '+ Expand all context';
     });
+
+    // ── Filter panel toggle ──────────────────────────────────────────────────
+    document.getElementById('btn-filter').addEventListener('click', () => {
+        document.getElementById('filter-panel').classList.toggle('hidden');
+    });
+
+    // ── Filtering logic ──────────────────────────────────────────────────────
+    const activeSheets = new Set(
+        [...document.querySelectorAll('.sheet-chip')].map(c => c.dataset.sheet)
+    );
+
+    function applyFilters() {
+        const colRaw  = document.getElementById('filter-col').value.trim().toUpperCase();
+        const rowMin  = parseInt(document.getElementById('filter-row-min').value) || 0;
+        const rowMax  = parseInt(document.getElementById('filter-row-max').value) || Infinity;
+
+        // Parse column filter: comma-separated names e.g. "D,V,AE"
+        const colSet = colRaw ? new Set(colRaw.split(',').map(s => s.trim()).filter(Boolean)) : null;
+
+        let visible = 0;
+        document.querySelectorAll('tr[data-sheet]').forEach(row => {
+            const sheet  = row.dataset.sheet;
+            const col    = row.dataset.col;
+            const rowNum = parseInt(row.dataset.row) || 0;
+
+            const sheetOk = activeSheets.has(sheet);
+            const colOk   = !colSet || colSet.has(col);
+            const rowOk   = rowNum >= rowMin && rowNum <= rowMax;
+
+            if (sheetOk && colOk && rowOk) {
+                row.classList.remove('filtered-out');
+                visible++;
+            } else {
+                row.classList.add('filtered-out');
+            }
+        });
+
+        // Hide entire sheet block when all its rows are filtered out
+        document.querySelectorAll('.sheet-block').forEach(block => {
+            const anyVisible = [...block.querySelectorAll('tr[data-sheet]')]
+                .some(r => !r.classList.contains('filtered-out'));
+            block.style.display = anyVisible ? '' : 'none';
+        });
+
+        document.getElementById('filter-count').textContent =
+            visible + ' row' + (visible !== 1 ? 's' : '') + ' shown';
+    }
+
+    // Sheet chip toggles
+    document.querySelectorAll('.sheet-chip').forEach(chip => {
+        chip.addEventListener('click', () => {
+            const s = chip.dataset.sheet;
+            if (activeSheets.has(s)) { activeSheets.delete(s); chip.classList.add('off'); }
+            else                      { activeSheets.add(s);    chip.classList.remove('off'); }
+            applyFilters();
+        });
+    });
+
+    // Input filters
+    ['filter-col','filter-row-min','filter-row-max'].forEach(id => {
+        document.getElementById(id).addEventListener('input', applyFilters);
+    });
+
+    // Clear filters
+    document.getElementById('btn-clear-filters').addEventListener('click', () => {
+        document.getElementById('filter-col').value = '';
+        document.getElementById('filter-row-min').value = '';
+        document.getElementById('filter-row-max').value = '';
+        document.querySelectorAll('.sheet-chip').forEach(c => {
+            c.classList.remove('off');
+            activeSheets.add(c.dataset.sheet);
+        });
+        applyFilters();
+    });
     """
 
     sheet_blocks = []
     total_changes = sum(len(v) for v in rows_by_sheet.values())
+    all_sheets_sorted = sorted(rows_by_sheet.keys())
+    sheet_chips_html = "".join(
+        f'<span class="sheet-chip" data-sheet="{html_mod.escape(s)}">'
+        f'&#128196; {html_mod.escape(s)}</span>'
+        for s in all_sheets_sorted
+    )
 
     for sheet in sorted(rows_by_sheet):
         rows = rows_by_sheet[sheet]
@@ -637,7 +743,10 @@ def _build_html_report(
                 else '<td class="new" style="background:transparent"></td>'
             )
             table_rows.append(
-                f'<tr class="{r["type"]}">'
+                f'<tr class="{r["type"]}" '
+                f'data-sheet="{html_mod.escape(r["sheet"])}" '
+                f'data-col="{html_mod.escape(r["col"])}" '
+                f'data-row="{r["row"]}">'
                 f'{coord_cell}'
                 f'{old_cell}{new_cell}'
                 f'</tr>'
@@ -669,8 +778,30 @@ def _build_html_report(
 <body>
 <h1>FormDiff Report &nbsp;<span>{html_mod.escape(base_file)} → {html_mod.escape(target_file)}</span></h1>
 <div class="toolbar">
-  <span style="color:#8b949e;font-size:11px">{total_changes} change{"s" if total_changes != 1 else ""} across {len(rows_by_sheet)} sheet{"s" if len(rows_by_sheet) != 1 else ""}</span>
+  <span style="color:#8b949e;font-size:11px" id="filter-count">{total_changes} change{"s" if total_changes != 1 else ""} across {len(rows_by_sheet)} sheet{"s" if len(rows_by_sheet) != 1 else ""}</span>
+  <button class="toolbar-btn" id="btn-filter">&#9660; Filter</button>
   <button class="toolbar-btn" id="btn-expand-all">+ Expand all context</button>
+</div>
+<div class="filter-panel hidden" id="filter-panel">
+  <div class="filter-group">
+    <div class="filter-label">Sheets</div>
+    <div class="filter-sheets">{sheet_chips_html}</div>
+  </div>
+  <div class="filter-group">
+    <div class="filter-label">Column</div>
+    <input class="filter-input" id="filter-col" placeholder="D,V,AE" title="Comma-separated column names">
+  </div>
+  <div class="filter-group">
+    <div class="filter-label">Row range</div>
+    <div class="filter-row-wrap">
+      <input class="filter-input" id="filter-row-min" placeholder="min" type="number" min="1">
+      <span class="filter-sep">–</span>
+      <input class="filter-input" id="filter-row-max" placeholder="max" type="number" min="1">
+    </div>
+  </div>
+  <div class="filter-group" style="justify-content:flex-end;margin-top:14px">
+    <button class="filter-clear" id="btn-clear-filters">&#10005; Clear filters</button>
+  </div>
 </div>
 {"".join(sheet_blocks)}
 <script>{JS}</script>
