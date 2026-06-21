@@ -60,14 +60,20 @@ def _coord_sort_key(entry: str) -> tuple:
     return (sheet, col_index, row_num)
 
 
-def extract_formulas(file_path: str, ignore_sheets: set[str] | None = None) -> list[str]:
+def extract_formulas(
+    file_path: str,
+    ignore_sheets: set[str] | None = None,
+    only_sheets: set[str] | None = None,
+) -> list[str]:
     """
     Open *file_path* in read-only mode and return a sorted list of formula
     strings in the format ``SheetName!A1: =SUM(B1:B10)``.
 
     Static values, blanks, dates, and plain numbers are skipped.
     ``read_only=True`` keeps memory usage low for large workbooks.
-    Sheets whose names appear in *ignore_sheets* are skipped entirely.
+    Sheets in *ignore_sheets* are skipped entirely.
+    If *only_sheets* is provided, every sheet NOT in that set is skipped
+    (whitelist mode). *ignore_sheets* is still applied on top of *only_sheets*.
     Entries are sorted in natural spreadsheet order (A1, A2...A10, B1...).
     """
     try:
@@ -80,6 +86,8 @@ def extract_formulas(file_path: str, ignore_sheets: set[str] | None = None) -> l
     records: list[str] = []
     for sheet_name in wb.sheetnames:
         if sheet_name in skipped:
+            continue
+        if only_sheets is not None and sheet_name not in only_sheets:
             continue
         sheet = wb[sheet_name]
         for row in sheet.iter_rows(values_only=False):
@@ -206,6 +214,7 @@ def run_diff(
     output_path: str | None = None,
     context_lines: int = 3,
     ignore_sheets: set[str] | None = None,
+    only_sheets: set[str] | None = None,
     summary: bool = False,
 ) -> bool:
     """
@@ -215,10 +224,11 @@ def run_diff(
     If *output_path* is given the raw unified diff (no ANSI codes) is written
     to that file instead of being printed to stdout.
     Sheets listed in *ignore_sheets* are excluded from both files.
+    If *only_sheets* is provided, only those sheets are diffed (whitelist).
     If *summary* is True, a grouped change digest is printed after the diff.
     """
-    base_set = extract_formulas(base_file, ignore_sheets=ignore_sheets)
-    target_set = extract_formulas(target_file, ignore_sheets=ignore_sheets)
+    base_set = extract_formulas(base_file, ignore_sheets=ignore_sheets, only_sheets=only_sheets)
+    target_set = extract_formulas(target_file, ignore_sheets=ignore_sheets, only_sheets=only_sheets)
 
     diff_lines = list(
         difflib.unified_diff(
@@ -297,6 +307,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sheet name to ignore (can be repeated: -x LTOP -x Summary)",
     )
     parser.add_argument(
+        "-i",
+        "--include-sheet",
+        action="append",
+        metavar="SHEET",
+        dest="include_sheets",
+        default=[],
+        help="Only diff this sheet — all others are ignored (can be repeated: -i BOM -i F2)",
+    )
+    parser.add_argument(
         "-s",
         "--summary",
         action="store_true",
@@ -316,6 +335,10 @@ def main() -> None:
             sys.exit(1)
 
     ignore_sheets = set(args.exclude_sheets) if args.exclude_sheets else None
+    only_sheets = set(args.include_sheets) if args.include_sheets else None
+
+    if only_sheets:
+        print(f"Only diffing sheets: {', '.join(sorted(only_sheets))}")
     if ignore_sheets:
         print(f"Ignoring sheets: {', '.join(sorted(ignore_sheets))}")
 
@@ -326,6 +349,7 @@ def main() -> None:
         output_path=args.output,
         context_lines=args.context,
         ignore_sheets=ignore_sheets,
+        only_sheets=only_sheets,
         summary=args.summary,
     )
     sys.exit(1 if changed else 0)
