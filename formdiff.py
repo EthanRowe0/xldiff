@@ -540,23 +540,73 @@ def _build_html_report(
                  color: #8b949e; cursor: pointer; font-size: 11px; padding: 0 4px;
                  margin: 0 2px; line-height: 1.4; vertical-align: middle; }
     .ctx-btn:hover { background: #30363d; color: #e6edf3; }
+    /* Per-row expand/collapse button */
+    .row-ctx-btn { display: block; margin-top: 5px; width: 100%; background: none;
+                   border: 1px solid #30363d; border-radius: 3px; color: #8b949e;
+                   cursor: pointer; font-size: 10px; padding: 1px 4px; text-align: center; }
+    .row-ctx-btn:hover { background: #21262d; color: #e6edf3; }
+    /* Global toolbar */
+    .toolbar { padding: 8px 20px; background: #161b22; border-bottom: 1px solid #30363d;
+               display: flex; gap: 8px; align-items: center; }
+    .toolbar-btn { background: #21262d; border: 1px solid #30363d; border-radius: 4px;
+                   color: #c9d1d9; cursor: pointer; font-size: 11px; padding: 3px 10px; }
+    .toolbar-btn:hover { background: #30363d; color: #e6edf3; }
     """
 
     JS = """
+    // ── Sheet collapse ──────────────────────────────────────────────────────
     document.querySelectorAll('.sheet-header').forEach(h => {
-        h.addEventListener('click', () => {
+        h.addEventListener('click', e => {
+            if (e.target.closest('.row-ctx-btn, .ctx-btn, .toolbar-btn')) return;
             const body = h.nextElementSibling;
             body.classList.toggle('collapsed');
-            h.querySelector('.toggle').textContent = body.classList.contains('collapsed') ? '▶' : '▼';
+            h.querySelector('.toggle').textContent =
+                body.classList.contains('collapsed') ? '▶' : '▼';
         });
     });
+
+    // ── Individual ellipsis expand ───────────────────────────────────────────
+    function expandWrap(wrap) {
+        wrap.querySelector('.ctx-short').style.display = 'none';
+        wrap.querySelector('.ctx-full').style.display  = 'inline';
+        wrap.dataset.expanded = '1';
+    }
+    function collapseWrap(wrap) {
+        wrap.querySelector('.ctx-short').style.display = 'inline';
+        wrap.querySelector('.ctx-full').style.display  = 'none';
+        delete wrap.dataset.expanded;
+    }
     document.querySelectorAll('.ctx-btn').forEach(btn => {
         btn.addEventListener('click', e => {
             e.stopPropagation();
-            const wrap = btn.closest('.ctx-wrap');
-            wrap.querySelector('.ctx-short').style.display = 'none';
-            wrap.querySelector('.ctx-full').style.display   = 'inline';
+            expandWrap(btn.closest('.ctx-wrap'));
         });
+    });
+
+    // ── Per-row expand / collapse ────────────────────────────────────────────
+    document.querySelectorAll('.row-ctx-btn').forEach(btn => {
+        btn.addEventListener('click', e => {
+            e.stopPropagation();
+            const row = btn.closest('tr');
+            const wraps = row.querySelectorAll('.ctx-wrap');
+            const anyCollapsed = [...wraps].some(w => !w.dataset.expanded);
+            wraps.forEach(w => anyCollapsed ? expandWrap(w) : collapseWrap(w));
+            btn.textContent = anyCollapsed ? '− collapse context' : '+ expand context';
+        });
+    });
+
+    // ── Global expand / collapse all ────────────────────────────────────────
+    let allExpanded = false;
+    document.getElementById('btn-expand-all').addEventListener('click', () => {
+        allExpanded = !allExpanded;
+        document.querySelectorAll('.ctx-wrap').forEach(
+            w => allExpanded ? expandWrap(w) : collapseWrap(w)
+        );
+        document.querySelectorAll('.row-ctx-btn').forEach(btn => {
+            btn.textContent = allExpanded ? '− collapse context' : '+ expand context';
+        });
+        document.getElementById('btn-expand-all').textContent =
+            allExpanded ? '− Collapse all context' : '+ Expand all context';
     });
     """
 
@@ -572,7 +622,10 @@ def _build_html_report(
                 f'<br><span class="count-badge">×{r["count"]}</span>'
                 if r["count"] > 1 else ""
             )
-            coord_cell = f'<td class="coord">{r["coord"]}{count_badge}</td>'
+            # Only show per-row button if the row actually has collapsible content
+            has_ctx = 'ctx-wrap' in r.get("old", "") or 'ctx-wrap' in r.get("new", "")
+            row_btn = '<button class="row-ctx-btn">+ expand context</button>' if has_ctx else ""
+            coord_cell = f'<td class="coord">{r["coord"]}{count_badge}{row_btn}</td>'
             old_cell = (
                 f'<td class="old">{r["old"]}</td>'
                 if r["old"] != ""
@@ -615,7 +668,10 @@ def _build_html_report(
 </head>
 <body>
 <h1>FormDiff Report &nbsp;<span>{html_mod.escape(base_file)} → {html_mod.escape(target_file)}</span></h1>
-<div class="summary-bar">{total_changes} formula change{"s" if total_changes != 1 else ""} across {len(rows_by_sheet)} sheet{"s" if len(rows_by_sheet) != 1 else ""}</div>
+<div class="toolbar">
+  <span style="color:#8b949e;font-size:11px">{total_changes} change{"s" if total_changes != 1 else ""} across {len(rows_by_sheet)} sheet{"s" if len(rows_by_sheet) != 1 else ""}</span>
+  <button class="toolbar-btn" id="btn-expand-all">+ Expand all context</button>
+</div>
 {"".join(sheet_blocks)}
 <script>{JS}</script>
 </body>
