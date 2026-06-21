@@ -23,6 +23,11 @@ init(autoreset=True)
 ARRAY_FORMULA_RE = re.compile(r"^\{(=.*)\}$", re.DOTALL)
 COORD_RE = re.compile(r"\$?([A-Za-z]+)\$?(\d+)$")
 ENTRY_COORD_RE = re.compile(r"^(.+)!(\$?[A-Za-z]+\$?\d+): ")
+# Matches compact collapsed lines: -[×78] Sheet!A1:A78: =formula
+COMPACT_ENTRY_RE = re.compile(r"^([+\-])\[×(\d+)\] (.+)!([A-Za-z0-9:$]+): (.+)$")
+
+# Characters of equal context shown each side of a change before collapsing to ellipsis
+_CTX_SHOW = 25
 
 
 # ---------------------------------------------------------------------------
@@ -302,27 +307,66 @@ def print_summary(diff_lines: list[str]) -> None:
 # HTML report
 # ---------------------------------------------------------------------------
 
+def _collapse_ctx(text: str) -> str:
+    """
+    Render an equal (unchanged) segment. If it exceeds _CTX_SHOW*2 characters,
+    show the first and last _CTX_SHOW chars with a clickable ellipsis in between
+    that expands to the full text.
+    """
+    if len(text) <= _CTX_SHOW * 2:
+        return html_mod.escape(text)
+    head = html_mod.escape(text[:_CTX_SHOW])
+    tail = html_mod.escape(text[-_CTX_SHOW:])
+    full = html_mod.escape(text)
+    uid  = id(text)  # unique enough for DOM identity within a page render
+    return (
+        f'<span class="ctx-wrap">'
+        f'<span class="ctx-short">{head}'
+        f'<button class="ctx-btn" title="Click to show hidden text">…</button>'
+        f'{tail}</span>'
+        f'<span class="ctx-full">{full}</span>'
+        f'</span>'
+    )
+
+
 def _char_diff_html(old: str, new: str) -> tuple[str, str]:
     """
-    Return (old_html, new_html) with character-level differences wrapped in
-    <mark> tags so the exact changed characters are highlighted.
+    Return (old_html, new_html) with:
+    - changed characters wrapped in <mark> tags
+    - long unchanged segments collapsed to clickable ellipses
     """
     sm = difflib.SequenceMatcher(None, old, new, autojunk=False)
     old_parts, new_parts = [], []
     for op, i1, i2, j1, j2 in sm.get_opcodes():
-        old_seg = html_mod.escape(old[i1:i2])
-        new_seg = html_mod.escape(new[j1:j2])
         if op == "equal":
-            old_parts.append(old_seg)
-            new_parts.append(new_seg)
+            old_parts.append(_collapse_ctx(old[i1:i2]))
+            new_parts.append(_collapse_ctx(new[j1:j2]))
         elif op == "replace":
-            old_parts.append(f'<mark class="del-char">{old_seg}</mark>')
-            new_parts.append(f'<mark class="add-char">{new_seg}</mark>')
+            old_parts.append(f'<mark class="del-char">{html_mod.escape(old[i1:i2])}</mark>')
+            new_parts.append(f'<mark class="add-char">{html_mod.escape(new[j1:j2])}</mark>')
         elif op == "delete":
-            old_parts.append(f'<mark class="del-char">{old_seg}</mark>')
+            old_parts.append(f'<mark class="del-char">{html_mod.escape(old[i1:i2])}</mark>')
         elif op == "insert":
-            new_parts.append(f'<mark class="add-char">{new_seg}</mark>')
+            new_parts.append(f'<mark class="add-char">{html_mod.escape(new[j1:j2])}</mark>')
     return "".join(old_parts), "".join(new_parts)
+
+
+def _parse_any_entry(line: str) -> tuple[str, str, str, str, int] | None:
+    """
+    Parse both regular and compact diff lines.
+    Returns (sign, sheet, coord_label, formula, count) or None.
+    count=1 for regular lines, count=N for compact [×N] lines.
+    """
+    # Try compact format first: -[×78] Sheet!A1:A78: =formula
+    m = COMPACT_ENTRY_RE.match(line)
+    if m:
+        return (m.group(1), m.group(3), m.group(4), m.group(5), int(m.group(2)))
+    # Try regular format
+    parsed = _parse_entry(line)
+    if parsed:
+        sign, sheet, coord, formula = parsed
+        return (sign, sheet, coord, formula, 1)
+    return None
 
 
 def _build_html_report(
@@ -332,52 +376,49 @@ def _build_html_report(
 ) -> str:
     """Generate a self-contained HTML diff report from unified diff lines."""
 
-    # Pair up removed/added lines for the same cell for inline char diff
-    # Collect rows grouped by sheet
     rows_by_sheet: dict[str, list[dict]] = defaultdict(list)
+    # (coord, formula, count)
+    pending_removed: list[tuple[str, str, int]] = []
+    pending_added:   list[tuple[str, str, int]] = []
 
-    # We'll scan the diff and pair consecutive - / + blocks per cell coord
-    pending_removed: list[tuple[str, str, str]] = []   # (coord, formula, raw_line)
-    pending_added:   list[tuple[str, str, str]] = []
-
-    def flush_pairs(sheet):
-        n_rem = len(pending_removed)
-        n_add = len(pending_added)
-        pairs = min(n_rem, n_add)
+    def flush_pairs(sheet: str) -> None:
+        pairs = min(len(pending_removed), len(pending_added))
         for i in range(pairs):
-            coord_r, old_f, _ = pending_removed[i]
-            coord_a, new_f, _ = pending_added[i]
+            coord_r, old_f, cnt_r = pending_removed[i]
+            coord_a, new_f, cnt_a = pending_added[i]
             coord = coord_r if coord_r == coord_a else f"{coord_r} / {coord_a}"
+            count = max(cnt_r, cnt_a)
             old_html, new_html = _char_diff_html(old_f, new_f)
             rows_by_sheet[sheet].append({
                 "type": "change",
                 "coord": html_mod.escape(coord),
+                "count": count,
                 "old": old_html,
                 "new": new_html,
             })
-        # Unpaired removals
-        for coord, formula, _ in pending_removed[pairs:]:
+        for coord, formula, count in pending_removed[pairs:]:
             rows_by_sheet[sheet].append({
                 "type": "remove",
                 "coord": html_mod.escape(coord),
+                "count": count,
                 "old": html_mod.escape(formula),
                 "new": "",
             })
-        # Unpaired additions
-        for coord, formula, _ in pending_added[pairs:]:
+        for coord, formula, count in pending_added[pairs:]:
             rows_by_sheet[sheet].append({
                 "type": "add",
                 "coord": html_mod.escape(coord),
+                "count": count,
                 "old": "",
                 "new": html_mod.escape(formula),
             })
 
     current_sheet = None
     for line in diff_lines:
-        parsed = _parse_entry(line)
+        parsed = _parse_any_entry(line)
         if parsed is None:
             continue
-        sign, sheet, coord, formula = parsed
+        sign, sheet, coord, formula, count = parsed
 
         if sheet != current_sheet:
             if current_sheet is not None:
@@ -387,18 +428,13 @@ def _build_html_report(
             current_sheet = sheet
 
         if sign == "-":
-            # If we hit a new - after pending adds, flush first
             if pending_added:
                 flush_pairs(current_sheet)
                 pending_removed.clear()
                 pending_added.clear()
-            pending_removed.append((coord, formula, line))
+            pending_removed.append((coord, formula, count))
         elif sign == "+":
-            pending_added.append((coord, formula, line))
-        elif sign == " ":
-            flush_pairs(current_sheet)
-            pending_removed.clear()
-            pending_added.clear()
+            pending_added.append((coord, formula, count))
 
     if current_sheet is not None:
         flush_pairs(current_sheet)
@@ -420,15 +456,17 @@ def _build_html_report(
     .sheet-body { display: block; }
     .sheet-body.collapsed { display: none; }
     table { width: 100%; border-collapse: collapse; }
-    col.col-coord { width: 80px; }
-    col.col-old, col.col-new { width: calc(50% - 40px); }
+    col.col-coord { width: 90px; }
+    col.col-old, col.col-new { width: calc(50% - 45px); }
     thead th { padding: 6px 10px; background: #161b22; color: #8b949e;
                font-weight: 500; font-size: 11px; text-align: left;
                border-bottom: 1px solid #30363d; position: sticky; top: 0; }
     tr { border-bottom: 1px solid #21262d; }
     tr:last-child { border-bottom: none; }
-    td { padding: 5px 10px; vertical-align: top; word-break: break-all; line-height: 1.5; }
+    td { padding: 5px 10px; vertical-align: top; word-break: break-all; line-height: 1.6; }
     td.coord { color: #8b949e; white-space: nowrap; }
+    .count-badge { display: inline-block; font-size: 10px; background: #30363d;
+                   color: #8b949e; border-radius: 10px; padding: 0 5px; margin-top: 2px; }
     tr.change td.old { background: #3d1f1f; color: #ffa198; }
     tr.change td.new { background: #1a2d1a; color: #7ee787; }
     tr.remove td.old { background: #3d1f1f; color: #ffa198; }
@@ -438,6 +476,13 @@ def _build_html_report(
     mark.del-char { background: #b62324; color: #fff; border-radius: 2px; padding: 0 1px; }
     mark.add-char { background: #1f6823; color: #fff; border-radius: 2px; padding: 0 1px; }
     .summary-bar { padding: 10px 20px 6px; color: #8b949e; font-size: 11px; }
+    /* Ellipsis context collapsing */
+    .ctx-full  { display: none; }
+    .ctx-short { display: inline; }
+    .ctx-btn   { background: none; border: 1px solid #444c56; border-radius: 3px;
+                 color: #8b949e; cursor: pointer; font-size: 11px; padding: 0 4px;
+                 margin: 0 2px; line-height: 1.4; vertical-align: middle; }
+    .ctx-btn:hover { background: #30363d; color: #e6edf3; }
     """
 
     JS = """
@@ -446,6 +491,14 @@ def _build_html_report(
             const body = h.nextElementSibling;
             body.classList.toggle('collapsed');
             h.querySelector('.toggle').textContent = body.classList.contains('collapsed') ? '▶' : '▼';
+        });
+    });
+    document.querySelectorAll('.ctx-btn').forEach(btn => {
+        btn.addEventListener('click', e => {
+            e.stopPropagation();
+            const wrap = btn.closest('.ctx-wrap');
+            wrap.querySelector('.ctx-short').style.display = 'none';
+            wrap.querySelector('.ctx-full').style.display   = 'inline';
         });
     });
     """
@@ -458,11 +511,24 @@ def _build_html_report(
         n = len(rows)
         table_rows = []
         for r in rows:
-            old_cell = f'<td class="old">{r["old"]}</td>' if r["old"] != "" else '<td class="old" style="background:transparent"></td>'
-            new_cell = f'<td class="new">{r["new"]}</td>' if r["new"] != "" else '<td class="new" style="background:transparent"></td>'
+            count_badge = (
+                f'<br><span class="count-badge">×{r["count"]}</span>'
+                if r["count"] > 1 else ""
+            )
+            coord_cell = f'<td class="coord">{r["coord"]}{count_badge}</td>'
+            old_cell = (
+                f'<td class="old">{r["old"]}</td>'
+                if r["old"] != ""
+                else '<td class="old" style="background:transparent"></td>'
+            )
+            new_cell = (
+                f'<td class="new">{r["new"]}</td>'
+                if r["new"] != ""
+                else '<td class="new" style="background:transparent"></td>'
+            )
             table_rows.append(
                 f'<tr class="{r["type"]}">'
-                f'<td class="coord">{r["coord"]}</td>'
+                f'{coord_cell}'
                 f'{old_cell}{new_cell}'
                 f'</tr>'
             )
@@ -553,6 +619,10 @@ def run_diff(
             compact_path = _compact_output_path(output_path)
             Path(compact_path).write_text("\n".join(compact_lines) + "\n", encoding="utf-8")
             print(f"Compact diff written to {compact_path}")
+            compact_html = _build_html_report(compact_lines, base_file, target_file)
+            compact_html_path = _html_output_path(compact_path)
+            Path(compact_html_path).write_text(compact_html, encoding="utf-8")
+            print(f"Compact HTML report written to {compact_html_path}")
 
         html_report = _build_html_report(diff_lines, base_file, target_file)
         html_path = _html_output_path(output_path)
