@@ -19,18 +19,24 @@ from colorama import init, Fore, Style
 
 init(autoreset=True)
 
-ARRAY_FORMULA_RE = re.compile(r"^\{(=.*)\}$")
+ARRAY_FORMULA_RE = re.compile(r"^\{(=.*)\}$", re.DOTALL)
 # Matches a cell coordinate like A1, BC204, $AF$3 — captures column letters and row number
 COORD_RE = re.compile(r"\$?([A-Za-z]+)\$?(\d+)$")
+# Matches the coord portion of a serialized entry: "Sheet!A1: =..."
+ENTRY_COORD_RE = re.compile(r"^(.+)!(\$?[A-Za-z]+\$?\d+): ")
 
 
 def _normalize_formula(raw: str) -> str:
-    """Strip array-formula braces and whitespace so comparisons are canonical."""
+    """
+    Strip array-formula braces, collapse embedded newlines, and trim whitespace
+    so each formula serializes as a single line and comparisons are canonical.
+    """
     stripped = raw.strip()
     m = ARRAY_FORMULA_RE.match(stripped)
     if m:
-        return m.group(1)
-    return stripped
+        stripped = m.group(1)
+    # Replace any embedded newlines (Excel line-break characters) with a space
+    return re.sub(r"[\r\n]+", " ", stripped).strip()
 
 
 def _coord_sort_key(entry: str) -> tuple:
@@ -41,7 +47,6 @@ def _coord_sort_key(entry: str) -> tuple:
 
     Example order: A1, A2, A10, B1, B2 ... (not A1, A10, A2, B1 ...)
     """
-    # entry format: "SheetName!COL ROW: =FORMULA"
     bang = entry.find("!")
     colon = entry.find(":", bang)
     if bang == -1 or colon == -1:
@@ -53,7 +58,6 @@ def _coord_sort_key(entry: str) -> tuple:
         return (sheet, coord)
     col_letters = m.group(1).upper()
     row_num = int(m.group(2))
-    # Convert column letters to a numeric index so AA sorts after Z
     col_index = 0
     for ch in col_letters:
         col_index = col_index * 26 + (ord(ch) - ord("A") + 1)
@@ -75,6 +79,7 @@ def extract_formulas(
     If *only_sheets* is provided, every sheet NOT in that set is skipped
     (whitelist mode). *ignore_sheets* is still applied on top of *only_sheets*.
     Entries are sorted in natural spreadsheet order (A1, A2...A10, B1...).
+    Embedded newlines inside formulas are collapsed to a single space.
     """
     try:
         wb = load_workbook(file_path, data_only=False, read_only=True)
@@ -93,7 +98,7 @@ def extract_formulas(
         for row in sheet.iter_rows(values_only=False):
             for cell in row:
                 val = cell.value
-                if isinstance(val, str) and val.startswith("="):
+                if isinstance(val, str) and val.lstrip().startswith("="):
                     formula = _normalize_formula(val)
                     records.append(f"{sheet_name}!{cell.coordinate}: {formula}")
 
@@ -103,46 +108,200 @@ def extract_formulas(
 
 
 # ---------------------------------------------------------------------------
-# Summary helpers
+# Compact diff helpers
 # ---------------------------------------------------------------------------
 
-def _parse_diff_entry(line: str) -> tuple[str, str, str] | None:
+def _parse_entry(line: str) -> tuple[str, str, str, str] | None:
     """
-    Given a raw diff line (with leading +/-/ ), return (sign, sheet, formula).
-    Returns None for hunk headers and file headers.
+    Parse a raw diff line into (sign, sheet, coord, formula).
+    Returns None for hunk/file headers or unparseable lines.
     """
     if not line or line.startswith("@@") or line.startswith("---") or line.startswith("+++"):
         return None
-    sign = line[0]  # '+', '-', or ' '
+    sign = line[0]
     rest = line[1:]
-    bang = rest.find("!")
-    colon = rest.find(": ", bang)
-    if bang == -1 or colon == -1:
+    m = ENTRY_COORD_RE.match(rest)
+    if not m:
         return None
-    sheet = rest[:bang]
-    formula = rest[colon + 2:]
-    return (sign, sheet, formula)
+    sheet = m.group(1)
+    coord = m.group(2)
+    formula = rest[m.end():]
+    return (sign, sheet, coord, formula)
+
+
+def _col_letters(coord: str) -> str:
+    """Extract just the column letters from a coordinate like $AF$3 or D119."""
+    m = COORD_RE.search(coord.replace("$", ""))
+    return m.group(1).upper() if m else ""
+
+
+def _row_num(coord: str) -> int:
+    """Extract the row number from a coordinate."""
+    m = COORD_RE.search(coord)
+    return int(m.group(2)) if m else -1
+
+
+def _col_to_index(col: str) -> int:
+    idx = 0
+    for ch in col.upper():
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx
+
+
+def build_compact_diff(diff_lines: list[str]) -> list[str]:
+    """
+    Return a compacted version of *diff_lines* where runs of consecutive cells
+    in the same column that all have the same formula change are collapsed into
+    a single annotated line:
+
+        -[×N] Sheet!ColFIRST:ColLAST  <old_formula_template>
+        +[×N] Sheet!ColFIRST:ColLAST  <new_formula_template>
+
+    Context lines and hunk headers are preserved as-is.
+    A run is only collapsed when N >= 2.
+    """
+    # First pass: collect all changed entries keyed by (sign, sheet, col, formula)
+    # so we can detect runs of consecutive rows.
+
+    # We'll work entry by entry and group runs on the fly.
+    # Strategy: scan through diff_lines; accumulate consecutive (+/-) entries
+    # that share the same sheet + column + formula pattern; flush when broken.
+
+    result: list[str] = []
+
+    # A "run" is a list of (sign, sheet, coord, formula, original_line)
+    pending_removed: list[tuple] = []
+    pending_added: list[tuple] = []
+
+    def _flush(removed: list[tuple], added: list[tuple]) -> list[str]:
+        """Collapse or emit a matched block of removed/added lines."""
+        out: list[str] = []
+        n_rem = len(removed)
+        n_add = len(added)
+
+        # Only collapse when counts match, same col, same template, consecutive rows
+        def is_collapsible(entries: list[tuple]) -> bool:
+            if len(entries) < 2:
+                return False
+            sheet0, col0, formula0 = entries[0][1], _col_letters(entries[0][2]), entries[0][3]
+            for i, (_, sh, coord, fml, _) in enumerate(entries):
+                if sh != sheet0 or _col_letters(coord) != col0:
+                    return False
+                # rows must be consecutive
+                if i > 0 and _row_num(entries[i][2]) != _row_num(entries[i-1][2]) + 1:
+                    return False
+            return True
+
+        if n_rem == n_add and n_rem >= 2 and is_collapsible(removed) and is_collapsible(added):
+            n = n_rem
+            sheet = removed[0][1]
+            first_coord = removed[0][2]
+            last_coord  = removed[-1][2]
+            col = _col_letters(first_coord)
+            first_row = _row_num(first_coord)
+            last_row  = _row_num(last_coord)
+            range_label = f"{sheet}!{col}{first_row}:{col}{last_row}"
+            old_formula = removed[0][3]
+            new_formula = added[0][3]
+            out.append(f"-[×{n}] {range_label}: {old_formula}")
+            out.append(f"+[×{n}] {range_label}: {new_formula}")
+        else:
+            for _, _, _, _, orig in removed:
+                out.append(orig)
+            for _, _, _, _, orig in added:
+                out.append(orig)
+        return out
+
+    for line in diff_lines:
+        parsed = _parse_entry(line)
+
+        if parsed is None:
+            # Non-entry line — flush pending and emit as-is
+            result.extend(_flush(pending_removed, pending_added))
+            pending_removed.clear()
+            pending_added.clear()
+            result.append(line)
+            continue
+
+        sign, sheet, coord, formula = parsed
+
+        if sign == " ":
+            result.extend(_flush(pending_removed, pending_added))
+            pending_removed.clear()
+            pending_added.clear()
+            result.append(line)
+        elif sign == "-":
+            # If this breaks the current removed run, flush first
+            if pending_removed:
+                prev = pending_removed[-1]
+                same_col = (_col_letters(prev[2]) == _col_letters(coord) and prev[1] == sheet)
+                consecutive = (_row_num(coord) == _row_num(prev[2]) + 1)
+                same_formula = (prev[3] == formula)
+                if not (same_col and consecutive and same_formula):
+                    result.extend(_flush(pending_removed, pending_added))
+                    pending_removed.clear()
+                    pending_added.clear()
+            pending_removed.append((sign, sheet, coord, formula, line))
+        elif sign == "+":
+            if pending_added:
+                prev = pending_added[-1]
+                same_col = (_col_letters(prev[2]) == _col_letters(coord) and prev[1] == sheet)
+                consecutive = (_row_num(coord) == _row_num(prev[2]) + 1)
+                same_formula = (prev[3] == formula)
+                if not (same_col and consecutive and same_formula):
+                    result.extend(_flush(pending_removed, pending_added))
+                    pending_removed.clear()
+                    pending_added.clear()
+            pending_added.append((sign, sheet, coord, formula, line))
+
+    result.extend(_flush(pending_removed, pending_added))
+    return result
+
+
+def _compact_output_path(output_path: str) -> str:
+    """Insert '-compact' before the file extension: foo.diff → foo-compact.diff"""
+    p = Path(output_path)
+    return str(p.with_stem(p.stem + "-compact"))
+
+
+# ---------------------------------------------------------------------------
+# Summary helpers
+# ---------------------------------------------------------------------------
+
+def _parse_diff_entry(line: str) -> tuple[str, str, str, str] | None:
+    """
+    Given a raw diff line (with leading +/-/ ), return (sign, sheet, coord, formula).
+    Returns None for hunk headers and file headers.
+    """
+    parsed = _parse_entry(line)
+    if parsed is None:
+        return None
+    sign, sheet, coord, formula = parsed
+    return (sign, sheet, coord, formula)
 
 
 def print_summary(diff_lines: list[str]) -> None:
     """
-    Print a human-readable grouped summary of what changed after the raw diff.
-    Groups identical formula-level changes (e.g. same substitution pattern
-    repeated across many cells) and counts them per sheet.
+    Print a human-readable grouped summary of what changed.
+
+    Per sheet, shows:
+    - Net additions / deletions
+    - For paired changes: the substitution pattern with count and cell ranges
+      e.g.  18x  $C$52 → $C$62   (V1119:V1196)
     """
-    # Collect removed and added formulas per sheet
-    removed: dict[str, list[str]] = defaultdict(list)
-    added: dict[str, list[str]] = defaultdict(list)
+    # Collect per-sheet lists of (coord, formula) for removed and added
+    removed: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    added:   dict[str, list[tuple[str, str]]] = defaultdict(list)
 
     for line in diff_lines:
         parsed = _parse_diff_entry(line)
         if parsed is None:
             continue
-        sign, sheet, formula = parsed
+        sign, sheet, coord, formula = parsed
         if sign == "-":
-            removed[sheet].append(formula)
+            removed[sheet].append((coord, formula))
         elif sign == "+":
-            added[sheet].append(formula)
+            added[sheet].append((coord, formula))
 
     all_sheets = sorted(set(list(removed) + list(added)))
     if not all_sheets:
@@ -151,7 +310,7 @@ def print_summary(diff_lines: list[str]) -> None:
     print(Fore.CYAN + Style.BRIGHT + "\n─── Change Summary ───────────────────────────────────")
 
     for sheet in all_sheets:
-        r = removed[sheet]
+        r = removed[sheet]   # list of (coord, formula)
         a = added[sheet]
         n_removed = len(r)
         n_added = len(a)
@@ -159,20 +318,20 @@ def print_summary(diff_lines: list[str]) -> None:
         print(Style.BRIGHT + f"\n  {sheet}")
 
         if n_removed == 0:
-            print(Fore.GREEN + f"    {n_added} formula(s) added")
+            # Pure additions — list ranges
+            ranges = _coords_to_ranges([coord for coord, _ in a])
+            print(Fore.GREEN + f"    {n_added} formula(s) added  [{ranges}]")
         elif n_added == 0:
-            print(Fore.RED + f"    {n_removed} formula(s) removed")
+            ranges = _coords_to_ranges([coord for coord, _ in r])
+            print(Fore.RED + f"    {n_removed} formula(s) removed  [{ranges}]")
         else:
-            # Try to surface repeated substitution patterns.
-            # Find pairs where only a substring changed (e.g. $C$52 → $C$62).
             pair_count = min(n_removed, n_added)
-            pattern_counts: dict[tuple[str, str], int] = defaultdict(int)
-            unpaired = 0
+            # Group by substitution pattern, tracking which coords had that pattern
+            pattern_coords: dict[tuple[str, str], list[str]] = defaultdict(list)
 
-            for old_f, new_f in zip(r[:pair_count], a[:pair_count]):
+            for (coord, old_f), (_, new_f) in zip(r[:pair_count], a[:pair_count]):
                 if old_f == new_f:
                     continue
-                # Find the first and last differing character to extract the changed segment
                 lo, hi_old, hi_new = 0, len(old_f), len(new_f)
                 while lo < min(hi_old, hi_new) and old_f[lo] == new_f[lo]:
                     lo += 1
@@ -180,27 +339,74 @@ def print_summary(diff_lines: list[str]) -> None:
                     hi_old -= 1
                     hi_new -= 1
                 changed_from = old_f[lo:hi_old]
-                changed_to = new_f[lo:hi_new]
+                changed_to   = new_f[lo:hi_new]
                 if changed_from and changed_to:
-                    pattern_counts[(changed_from, changed_to)] += 1
-                else:
-                    unpaired += 1
+                    pattern_coords[(changed_from, changed_to)].append(coord)
 
-            total_changed = n_removed + n_added - pair_count * 2 + pair_count
             print(f"    {max(n_removed, n_added)} formula(s) modified")
 
-            for (frm, to), count in sorted(pattern_counts.items(), key=lambda x: -x[1]):
+            for (frm, to), coords in sorted(pattern_coords.items(), key=lambda x: -len(x[1])):
+                count = len(coords)
+                ranges = _coords_to_ranges(coords)
                 print(
-                    Fore.RED   + f"      {count}x  {frm}"
+                    Fore.RED + f"      {count}x  {frm}"
                     + Style.RESET_ALL + "  →  "
                     + Fore.GREEN + f"{to}"
+                    + Style.DIM + f"   ({ranges})"
                 )
-            if abs(n_removed - n_added) > 0:
-                net = n_added - n_removed
+
+            net = n_added - n_removed
+            if net != 0:
                 label = "added" if net > 0 else "removed"
                 print(f"    {abs(net)} formula(s) net {label}")
 
     print(Fore.CYAN + "──────────────────────────────────────────────────────\n")
+
+
+def _coords_to_ranges(coords: list[str]) -> str:
+    """
+    Collapse a list of cell coordinates into compact range notation.
+
+    Consecutive rows in the same column are merged:
+    [D3, D4, D5, D10] → "D3:D5, D10"
+    [D3, F5]          → "D3, F5"
+    """
+    if not coords:
+        return ""
+
+    # Parse and sort by (col_index, row)
+    parsed = []
+    for c in coords:
+        m = COORD_RE.search(c.replace("$", ""))
+        if m:
+            col = m.group(1).upper()
+            row = int(m.group(2))
+            parsed.append((_col_to_index(col), col, row))
+
+    parsed.sort()
+
+    ranges: list[str] = []
+    if not parsed:
+        return ", ".join(coords)
+
+    run_col_idx, run_col, run_start, run_end = parsed[0]
+
+    for col_idx, col, row in parsed[1:]:
+        if col_idx == run_col_idx and row == run_end + 1:
+            run_end = row
+        else:
+            if run_end == run_start:
+                ranges.append(f"{run_col}{run_start}")
+            else:
+                ranges.append(f"{run_col}{run_start}:{run_col}{run_end}")
+            run_col_idx, run_col, run_start, run_end = col_idx, col, row, row
+
+    if run_end == run_start:
+        ranges.append(f"{run_col}{run_start}")
+    else:
+        ranges.append(f"{run_col}{run_start}:{run_col}{run_end}")
+
+    return ", ".join(ranges)
 
 
 # ---------------------------------------------------------------------------
@@ -216,16 +422,15 @@ def run_diff(
     ignore_sheets: set[str] | None = None,
     only_sheets: set[str] | None = None,
     summary: bool = False,
+    compact: bool = False,
 ) -> bool:
     """
     Compare formulas between *base_file* and *target_file*.
 
     Returns ``True`` when at least one difference is found.
     If *output_path* is given the raw unified diff (no ANSI codes) is written
-    to that file instead of being printed to stdout.
-    Sheets listed in *ignore_sheets* are excluded from both files.
-    If *only_sheets* is provided, only those sheets are diffed (whitelist).
-    If *summary* is True, a grouped change digest is printed after the diff.
+    to that file. When *compact* is also True, an additional '-compact' file
+    is written alongside it with run-length collapsed entries.
     """
     base_set = extract_formulas(base_file, ignore_sheets=ignore_sheets, only_sheets=only_sheets)
     target_set = extract_formulas(target_file, ignore_sheets=ignore_sheets, only_sheets=only_sheets)
@@ -252,8 +457,14 @@ def run_diff(
     if output_path:
         Path(output_path).write_text("\n".join(diff_lines) + "\n", encoding="utf-8")
         print(f"Diff written to {output_path}")
+        if compact:
+            compact_lines = build_compact_diff(diff_lines)
+            compact_path = _compact_output_path(output_path)
+            Path(compact_path).write_text("\n".join(compact_lines) + "\n", encoding="utf-8")
+            print(f"Compact diff written to {compact_path}")
     else:
-        for line in diff_lines:
+        display_lines = build_compact_diff(diff_lines) if compact else diff_lines
+        for line in display_lines:
             if line.startswith("+++") or line.startswith("---"):
                 print(Style.BRIGHT + line)
             elif line.startswith("+"):
@@ -322,6 +533,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Print a grouped change summary after the diff",
     )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        default=False,
+        help=(
+            "Collapse runs of identical consecutive-row changes into a single annotated line. "
+            "When used with -o, also writes a separate FILE-compact.diff alongside the full diff."
+        ),
+    )
     return parser
 
 
@@ -351,6 +571,7 @@ def main() -> None:
         ignore_sheets=ignore_sheets,
         only_sheets=only_sheets,
         summary=args.summary,
+        compact=args.compact,
     )
     sys.exit(1 if changed else 0)
 
