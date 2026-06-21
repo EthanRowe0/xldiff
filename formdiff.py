@@ -30,13 +30,14 @@ def _normalize_formula(raw: str) -> str:
     return stripped
 
 
-def extract_formulas(file_path: str) -> list[str]:
+def extract_formulas(file_path: str, ignore_sheets: set[str] | None = None) -> list[str]:
     """
     Open *file_path* in read-only mode and return a sorted list of formula
     strings in the format ``SheetName!A1: =SUM(B1:B10)``.
 
     Static values, blanks, dates, and plain numbers are skipped.
     ``read_only=True`` keeps memory usage low for large workbooks.
+    Sheets whose names appear in *ignore_sheets* are skipped entirely.
     """
     try:
         wb = load_workbook(file_path, data_only=False, read_only=True)
@@ -44,8 +45,11 @@ def extract_formulas(file_path: str) -> list[str]:
         print(f"Error opening workbook {file_path}: {e}", file=sys.stderr)
         sys.exit(1)
 
+    skipped = ignore_sheets or set()
     records: list[str] = []
     for sheet_name in wb.sheetnames:
+        if sheet_name in skipped:
+            continue
         sheet = wb[sheet_name]
         for row in sheet.iter_rows(values_only=False):
             for cell in row:
@@ -65,6 +69,7 @@ def run_diff(
     *,
     output_path: str | None = None,
     context_lines: int = 3,
+    ignore_sheets: set[str] | None = None,
 ) -> bool:
     """
     Compare formulas between *base_file* and *target_file*.
@@ -72,9 +77,10 @@ def run_diff(
     Returns ``True`` when at least one difference is found.
     If *output_path* is given the raw unified diff (no ANSI codes) is written
     to that file instead of being printed to stdout.
+    Sheets listed in *ignore_sheets* are excluded from both files.
     """
-    base_set = extract_formulas(base_file)
-    target_set = extract_formulas(target_file)
+    base_set = extract_formulas(base_file, ignore_sheets=ignore_sheets)
+    target_set = extract_formulas(target_file, ignore_sheets=ignore_sheets)
 
     diff_lines = list(
         difflib.unified_diff(
@@ -136,6 +142,15 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="Number of context lines around each change (default: 3)",
     )
+    parser.add_argument(
+        "-x",
+        "--exclude-sheet",
+        action="append",
+        metavar="SHEET",
+        dest="exclude_sheets",
+        default=[],
+        help="Sheet name to ignore (can be repeated: -x LTOP -x Summary)",
+    )
     return parser
 
 
@@ -148,12 +163,17 @@ def main() -> None:
             print(f"File not found: {path}", file=sys.stderr)
             sys.exit(1)
 
+    ignore_sheets = set(args.exclude_sheets) if args.exclude_sheets else None
+    if ignore_sheets:
+        print(f"Ignoring sheets: {', '.join(sorted(ignore_sheets))}")
+
     print(f"FormDiff: {args.base} → {args.target}\n")
     changed = run_diff(
         args.base,
         args.target,
         output_path=args.output,
         context_lines=args.context,
+        ignore_sheets=ignore_sheets,
     )
     sys.exit(1 if changed else 0)
 
