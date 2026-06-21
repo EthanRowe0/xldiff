@@ -27,20 +27,43 @@ ENTRY_COORD_RE = re.compile(r"^(.+)!(\$?[A-Za-z]+\$?\d+): ")
 COMPACT_ENTRY_RE = re.compile(r"^([+\-])\[×(\d+)\] (.+)!([A-Za-z0-9:$]+): (.+)$")
 
 # Characters of equal context shown each side of a change before collapsing to ellipsis
-_CTX_SHOW = 25
+_CTX_SHOW = 30
+# Formula characters that make natural ellipsis boundaries (argument separators / grouping)
+_FORMULA_BOUNDARIES = frozenset(',;()')
 
 
 # ---------------------------------------------------------------------------
 # Formula extraction
 # ---------------------------------------------------------------------------
 
+def _strip_formula_spaces(formula: str) -> str:
+    """
+    Remove all whitespace outside of double-quoted string literals.
+    Spaces inside strings like "text value" are preserved.
+    This ensures purely cosmetic spacing differences (indentation, spaces around
+    commas/parens) are never treated as meaningful formula changes.
+    """
+    result: list[str] = []
+    in_str = False
+    for ch in formula:
+        if ch == '"':
+            in_str = not in_str
+            result.append(ch)
+        elif in_str or ch not in (' ', '\t'):
+            result.append(ch)
+    return ''.join(result)
+
+
 def _normalize_formula(raw: str) -> str:
-    """Strip array-formula braces, collapse embedded newlines, trim whitespace."""
+    """Strip array-formula braces, collapse embedded newlines, strip non-string spaces."""
     stripped = raw.strip()
     m = ARRAY_FORMULA_RE.match(stripped)
     if m:
         stripped = m.group(1)
-    return re.sub(r"[\r\n]+", " ", stripped).strip()
+    # Collapse embedded newlines (from Excel line-break formatting) to spaces first,
+    # then strip all whitespace outside string literals so cosmetic spacing is ignored.
+    collapsed = re.sub(r"[\r\n]+", " ", stripped).strip()
+    return _strip_formula_spaces(collapsed)
 
 
 def _coord_sort_key(entry: str) -> tuple:
@@ -307,22 +330,56 @@ def print_summary(diff_lines: list[str]) -> None:
 # HTML report
 # ---------------------------------------------------------------------------
 
+def _boundary_cut_right(text: str, target: int) -> int:
+    """
+    Starting near *target*, scan forward up to 20 chars for a formula boundary
+    character (comma, paren) and return the index just after it — so the boundary
+    character itself is included in the visible head.
+    Falls back to *target* if none found.
+    """
+    for i in range(target, min(target + 20, len(text))):
+        if text[i] in _FORMULA_BOUNDARIES:
+            return i + 1
+    return target
+
+
+def _boundary_cut_left(text: str, target: int) -> int:
+    """
+    Starting near *target*, scan backward up to 20 chars for a formula boundary
+    character and return the index just after it — so the tail starts cleanly
+    after a separator.
+    Falls back to *target* if none found.
+    """
+    for i in range(min(target, len(text) - 1), max(target - 20, -1), -1):
+        if text[i] in _FORMULA_BOUNDARIES:
+            return i + 1
+    return target
+
+
 def _collapse_ctx(text: str) -> str:
     """
     Render an equal (unchanged) segment. If it exceeds _CTX_SHOW*2 characters,
-    show the first and last _CTX_SHOW chars with a clickable ellipsis in between
-    that expands to the full text.
+    show the head and tail with a clickable ellipsis in between.
+    Cut points snap to the nearest comma/paren so the ellipsis lands between
+    formula arguments rather than mid-word.
     """
-    if len(text) <= _CTX_SHOW * 2:
+    if len(text) <= _CTX_SHOW * 2 + 10:
         return html_mod.escape(text)
-    head = html_mod.escape(text[:_CTX_SHOW])
-    tail = html_mod.escape(text[-_CTX_SHOW:])
+
+    head_end   = _boundary_cut_right(text, _CTX_SHOW)
+    tail_start = _boundary_cut_left(text, len(text) - _CTX_SHOW)
+
+    # Safety: if snapping caused overlap, just fall back to no collapsing
+    if tail_start <= head_end:
+        return html_mod.escape(text)
+
+    head = html_mod.escape(text[:head_end])
+    tail = html_mod.escape(text[tail_start:])
     full = html_mod.escape(text)
-    uid  = id(text)  # unique enough for DOM identity within a page render
     return (
         f'<span class="ctx-wrap">'
         f'<span class="ctx-short">{head}'
-        f'<button class="ctx-btn" title="Click to show hidden text">…</button>'
+        f'<button class="ctx-btn" title="Click to expand hidden text">…</button>'
         f'{tail}</span>'
         f'<span class="ctx-full">{full}</span>'
         f'</span>'
